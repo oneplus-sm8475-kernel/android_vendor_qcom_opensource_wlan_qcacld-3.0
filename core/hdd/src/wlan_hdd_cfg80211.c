@@ -178,6 +178,11 @@
 #include "wlan_pkt_capture_ucfg_api.h"
 #include "os_if_pkt_capture.h"
 
+#ifdef OPLUS_BUG_STABILITY
+//Add for: hotspot manager
+#include <wlan_hdd_hostapd_wext.h>
+#endif /* OPLUS_BUG_STABILITY */
+
 #define g_mode_rates_size (12)
 #define a_mode_rates_size (8)
 
@@ -2986,6 +2991,38 @@ static void wlan_hdd_trim_acs_channel_list(uint32_t *pcl, uint8_t pcl_count,
 	*org_ch_list_count = ch_list_count;
 }
 
+/* wlan_hdd_dump_freq_list() - Dump the ACS master frequency list
+ *
+ * @freq_list: Frequency list
+ * @num_freq: num of frequencies in list
+ *
+ * Dump the ACS master frequency list.
+ */
+static inline
+void wlan_hdd_dump_freq_list(uint32_t *freq_list, uint8_t num_freq)
+{
+	uint32_t buf_len = 0;
+	uint32_t i = 0, j = 0;
+	uint8_t *master_chlist;
+
+	if (num_freq >= NUM_CHANNELS)
+		return;
+
+	buf_len = NUM_CHANNELS * 4;
+	master_chlist = qdf_mem_malloc(buf_len);
+
+	if (!master_chlist)
+		return;
+
+	for (i = 0; i < num_freq && j < buf_len; i++) {
+		j += qdf_scnprintf(master_chlist + j, buf_len - j,
+				   "%d ", freq_list[i]);
+	}
+
+	hdd_debug("Master channel list: %s", master_chlist);
+	qdf_mem_free(master_chlist);
+}
+
 /**
  * wlan_hdd_handle_zero_acs_list() - Handle worst case of acs channel
  * trimmed to zero
@@ -3032,12 +3069,22 @@ static void wlan_hdd_handle_zero_acs_list(struct hdd_context *hdd_ctx,
 	if (!sta_count && !force_sap_allowed)
 		return;
 
+	wlan_hdd_dump_freq_list(org_freq_list, org_ch_list_count);
+
 	for (i = 0; i < org_ch_list_count; i++) {
-		if (!wlan_reg_is_dfs_for_freq(hdd_ctx->pdev,
-					      org_freq_list[i])) {
-			acs_chan_default = org_freq_list[i];
-			break;
-		}
+		if (wlan_reg_is_dfs_for_freq(hdd_ctx->pdev,
+					     org_freq_list[i]))
+			continue;
+
+		if (wlan_reg_is_6ghz_chan_freq(org_freq_list[i]) &&
+		    !wlan_reg_is_6ghz_psc_chan_freq(org_freq_list[i]))
+			continue;
+
+		if (!policy_mgr_is_safe_channel(hdd_ctx->psoc,
+						org_freq_list[i]))
+			continue;
+		acs_chan_default = org_freq_list[i];
+		break;
 	}
 	if (!acs_chan_default)
 		acs_chan_default = org_freq_list[0];
@@ -12083,7 +12130,13 @@ __wlan_hdd_cfg80211_set_ns_offload(struct wiphy *wiphy,
 
 	if (!ucfg_pmo_is_active_mode_offloaded(hdd_ctx->psoc)) {
 		hdd_warn("Active mode offload is disabled");
+		#ifndef OPLUS_BUG_STABILITY
+		//Modify the return value for VTS test
 		return -EINVAL;
+		#else /* OPLUS_BUG_STABILITY */
+		return 0;
+		#endif /* OPLUS_BUG_STABILITY */
+
 	}
 
 	if (wlan_cfg80211_nla_parse(tb, QCA_WLAN_VENDOR_ATTR_ND_OFFLOAD_MAX,
@@ -15472,6 +15525,160 @@ put_attr_fail:
 	return -EINVAL;
 }
 
+#ifdef OPLUS_BUG_STABILITY
+//Add for: hotspot manager
+static const struct nla_policy
+oplus_attr_policy[OPLUS_WLAN_VENDOR_ATTR_MAX + 1] = {
+	[OPLUS_WLAN_VENDOR_ATTR_MAC_ADDR] = {.type = NLA_BINARY, .len = QDF_MAC_ADDR_SIZE},
+	[OPLUS_WLAN_VENDOR_ATTR_WETHER_BLOCK_CLIENT] = {.type = NLA_U8},
+	[OPLUS_WLAN_VENDOR_ATTR_SAP_MAX_CLIENT_NUM] = {.type = NLA_U32},
+};
+
+static int __wlan_hdd_cfg80211_oplus_modify_acl(struct wiphy *wiphy,
+					struct wireless_dev *wdev,
+					const void *data, int data_len)
+{
+	int32_t status;
+	struct nlattr* tb[OPLUS_WLAN_VENDOR_ATTR_MAX + 1];
+	uint8_t extra[8];
+	int8_t block;
+
+	hdd_enter();
+
+	status = wlan_cfg80211_nla_parse(tb, OPLUS_WLAN_VENDOR_ATTR_MAX,
+					data, data_len, oplus_attr_policy);
+	if (status) {
+		hdd_err("Invalid attributes!");
+		status = -EINVAL;
+		goto out;
+	}
+
+	if (tb[OPLUS_WLAN_VENDOR_ATTR_MAC_ADDR]) {
+		nla_memcpy(extra, tb[OPLUS_WLAN_VENDOR_ATTR_MAC_ADDR], QDF_MAC_ADDR_SIZE);
+	} else {
+		hdd_err("Invalid argument:No sta mac addr provided!");
+		status = -EINVAL;
+		goto out;
+	}
+	if (tb[OPLUS_WLAN_VENDOR_ATTR_WETHER_BLOCK_CLIENT]) {
+		block = nla_get_u8(tb[OPLUS_WLAN_VENDOR_ATTR_WETHER_BLOCK_CLIENT]);
+	} else {
+		hdd_err("Invalid argument:No block value!");
+		status = -EINVAL;
+		goto out;
+	}
+
+	//we always modify black list, as for now
+	extra[6] = 0;
+	extra[7] = block;
+
+	status = oplus_wlan_hdd_modify_acl(wdev->netdev, (char*)extra);
+	if (0 != status) {
+		hdd_err("failed to modify acl! %d", status);
+		goto out;
+	}
+
+out:
+	hdd_exit();
+	return status;
+}
+
+/**
+ * wlan_hdd_cfg80211_oplus_modify_acl() - modify acl
+ * @wiphy: Pointer to wiphy
+ * @wdev: Pointer to wireless device
+ * @data: vendor command extra data
+ * @data_len: the size of extra data
+ *
+ * Return: 0 for success, non-zero for failure
+ */
+static int wlan_hdd_cfg80211_oplus_modify_acl(struct wiphy *wiphy,
+				  struct wireless_dev *wdev,
+				  const void *data, int data_len)
+{
+	int errno;
+	struct osif_vdev_sync *vdev_sync;
+
+	errno = osif_vdev_sync_op_start(wdev->netdev, &vdev_sync);
+	if (errno)
+		return errno;
+
+	errno = __wlan_hdd_cfg80211_oplus_modify_acl(wiphy, wdev, data, data_len);
+
+	osif_vdev_sync_op_stop(vdev_sync);
+
+	return errno;
+}
+
+static int __wlan_hdd_cfg80211_oplus_set_max_assoc(struct wiphy *wiphy,
+					  struct wireless_dev *wdev,
+					  const void *data, int data_len)
+{
+	uint32_t status;
+	int extra[2];
+	uint32_t max_clients;
+	struct nlattr* tb[OPLUS_WLAN_VENDOR_ATTR_MAX + 1];
+
+	hdd_enter();
+
+	status = wlan_cfg80211_nla_parse(tb, OPLUS_WLAN_VENDOR_ATTR_MAX,
+					data, data_len, oplus_attr_policy);
+
+	if (status) {
+		hdd_err("Invalid attributes!");
+		status = -EINVAL;
+		goto out;
+	}
+
+	if (tb[OPLUS_WLAN_VENDOR_ATTR_SAP_MAX_CLIENT_NUM]) {
+		max_clients = nla_get_u32(tb[OPLUS_WLAN_VENDOR_ATTR_SAP_MAX_CLIENT_NUM]);
+	} else {
+		hdd_err("Invalid argument!");
+		status = -EINVAL;
+		goto out;
+	}
+
+	extra[0] = QCSAP_PARAM_MAX_ASSOC;
+	extra[1] = max_clients;
+
+	status = oplus_wlan_hdd_set_max_assoc(wdev->netdev, (char*)extra);
+	if (0 != status) {
+		hdd_err("failed to set max assoc!");
+		goto out;
+	}
+
+out:
+	hdd_exit();
+	return status;
+}
+
+/**
+ * wlan_hdd_cfg80211_oplus_set_max_assoc() - modify acl
+ * @wiphy: Pointer to wiphy
+ * @wdev: Pointer to wireless device
+ * @data: vendor command extra data
+ * @data_len: the size of extra data
+ *
+ * Return: 0 for success, non-zero for failure
+ */
+static int wlan_hdd_cfg80211_oplus_set_max_assoc(struct wiphy *wiphy,
+					  struct wireless_dev *wdev,
+					  const void *data, int data_len)
+{
+	int errno;
+	struct osif_vdev_sync *vdev_sync;
+
+	errno = osif_vdev_sync_op_start(wdev->netdev, &vdev_sync);
+	if (errno)
+		return errno;
+
+	errno = __wlan_hdd_cfg80211_oplus_set_max_assoc(wiphy, wdev, data, data_len);
+
+	osif_vdev_sync_op_stop(vdev_sync);
+
+	return errno;
+}
+#endif /* OPLUS_BUG_STABILITY */
 
 /**
  * __wlan_hdd_cfg80211_get_nud_stats() - get arp stats command to firmware
@@ -17510,6 +17717,30 @@ const struct wiphy_vendor_command hdd_wiphy_vendor_commands[] = {
 		vendor_command_policy(get_usable_channel_policy,
 				      QCA_WLAN_VENDOR_ATTR_MAX)
 	},
+
+	#ifdef OPLUS_BUG_STABILITY
+	//add for: hotspot manager via wificond
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = OPLUS_NL80211_VENDOR_SUBCMD_MODIFY_ACL,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_NETDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wlan_hdd_cfg80211_oplus_modify_acl,
+  		vendor_command_policy(oplus_attr_policy,
+					OPLUS_WLAN_VENDOR_ATTR_MAX)
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = OPLUS_NL80211_VENDOR_SUBCMD_SET_MAX_ASSOC,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+		     WIPHY_VENDOR_CMD_NEED_NETDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wlan_hdd_cfg80211_oplus_set_max_assoc,
+  		vendor_command_policy(oplus_attr_policy,
+					OPLUS_WLAN_VENDOR_ATTR_MAX)
+	},
+    #endif /* OPLUS_BUG_STABILITY */
 
 	FEATURE_ACTIVE_TOS_VENDOR_COMMANDS
 	FEATURE_NAN_VENDOR_COMMANDS

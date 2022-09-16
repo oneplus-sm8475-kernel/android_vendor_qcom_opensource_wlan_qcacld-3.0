@@ -5780,6 +5780,7 @@ int wlan_hdd_cfg80211_start_bss(struct hdd_adapter *adapter,
 			ret = -EINVAL;
 			goto error;
 		}
+
 		if (ie) {
 			bool target_bigtk_support = false;
 
@@ -5793,7 +5794,7 @@ int wlan_hdd_cfg80211_start_bss(struct hdd_adapter *adapter,
 						    &target_bigtk_support);
 			if (target_bigtk_support &&
 			    p_ext_cap.beacon_protection_enable)
-				mlme_set_bigtk_support(vdev, true);
+				mlme_set_bigtk_support(adapter->vdev, true);
 		}
 
 		/* Overwrite second AP's channel with first only when:
